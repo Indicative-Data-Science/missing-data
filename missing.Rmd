@@ -1,0 +1,485 @@
+---
+title: "Investigating missing data using areal-level estimates"
+author: "Terry Lines, University of Glasgow"
+date: "25/06/2021"
+output: html_document
+bibliography: spatialmissing.bib
+---
+
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 800)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(error = TRUE,tidy = TRUE,cache = TRUE)
+```
+
+## Introduction
+Missing data, defined broadly as missing observations, imprecise measurements, and indirect observations of variables, are increasingly important when analysing datasets. This is due in part to datasets arising as volunteered information or as an observational byproduct of digitised transactions [@hand2018statistical], however designed surveys also suffer through declining response rates [@national2013nonresponse]. 
+
+The value of geographic information in adjusting for unit non-response is recognised, as noted in comparisons between telephone-based sampling (random-digit-dialing), and addressed-based sampling [@battaglia2016sampling]. Auxiliary data is available both at an areal level (e.g. small area census data) and address specific (e.g. nature of address and any available geocoding matched information). The information can be used to to reduce non-response bias by calibrating sample aggregates against against the small area statistics [@lundstrom1999calibration], assigning attributes based on the areal information [@biemer2013using], or generating a response propensity model to predict response rates and adjust sampling plans accordingly [@bradley2015predicting]. 
+
+Item non-response (where a survey participant has provided a partial response) can also be corrected for, using a framework introduced by Rubin [@rubin1976inference], with solutions for imputing missing values such as expectation maximisation and multiple imputation techniques [@little2019statistical]. This is normally undertaken assuming an aspatial relationship, however, these techniques have been extended to spatial autoregressive models considering "Missing at Random" data [@kelejian2010spatial;@lesage2004models], as well as "Missing Not at Random" data through using a selection (Heckman) spatial autoregression model [@flores2012estimation;@geniaux2016heckman]. 
+<!-- A selection model models the joint distribution through a marginal distribution of the dependent variable and then a conditional model for missingness given the dependent variable.  -->
+<!-- No work to date has considered how missing data can be incorporated into spatial local rather than autocorrelated models [@fotheringham2009problem], for example  geographic weighted regression [@brunsdon1996geographically].  -->
+
+In this work we consider "Missing Not at Random" item non-response, where a survey participant has answered questions with the exception of a sensitive outcome, e.g. their level of income, where a "prefer not to answer" was recorded, and we believe the propensity to respond is linked to the unrecorded value. We wish to impute the outcome in order to use it in further analysis. 
+
+## Objective
+The objective of this work is to analyse a pattern of item non-response in a survey with participant location, to consider:
+
+1. whether there is a spatial structure in the patterns of missingness;
+2. whether the missingness is Not At Random. We consider both imputed values and areal-level estimates to approximate the missing data; 
+3. how estimates are affected by accounting for spatial autocorrelation. 
+    
+<!-- A linear regression of the outcome which only accounts for the observed values will give biased coefficient estimates, and this is accounted for by specifying a joint model for both the value of the outcome and its likelihood. However, parameter estimation is sensitive to the distribution of unseen outcome values and can be unreliable when the underlying assumptions do not hold.  -->
+
+<!-- A selection model approach specifies a logistic (or probit) model for response with the outcome  variable as a covariate. When the location of participants is available, we propose to use geographic information on the outcome variable to improve estimates by modelling the outcome as an areal level effect plus individual-level noise. We examine the uncertainty of this approach given the low predictive power of the areal level effects, and compare estimates if spatial dependence is taken into account through the use of a spatial autoregressive model. The consistency of our estimates will be considered by applying the technique to the repeated instances of the survey over time. -->
+
+## Dataset
+
+The UK National Travel Survey (NTS) will be used. The National Travel Survey is a household survey of personal travel within Great Britain, from data collected via interviews and a seven-day travel diary, which enables analysis of patterns and trends. Since 1988 it has been conducted on a continual basis, with around 15,000 households surveyed each year (since 2002 when sample size was increased). The rationale for using this survey is that it contains comprehensive demographic information for the participants including geography of the home address. Furthermore, because the demographic information is not the primary focus of the survey, item non-response, where participants declined to answer a question, was recorded in the survey without invalidating the response. 
+
+The open access version of the dataset bands key variables at a high-level, and provides location only at a regional level. However, for this work access was available under special licence to a safeguarded version for this project, which provides more detailed demographic information and address at a ward-level spatial resolution (an average of around 5,000 people per ward). The dataset covers all survey data from 2002 to 2019.
+
+## Methodology and Results
+```{r libraries,include=FALSE}
+require(tidyverse)
+require(sf)
+require(httr)
+require(jsonlite)
+require(spaMM)
+require(spdep)
+require(spatstat)
+require(ResourceSelection)
+require(mfp)
+require(ggplot2)
+```
+
+```{r import-data,include=FALSE,cache=TRUE}
+hh = read_tsv(paste('../UKDA-7553-tab/tab/','household_special_2002-2019_protect.tab',sep='/'))
+
+#identified social-economic characteristics
+features <- c('AddressType_B01ID',            # Type of property found at the address
+              'BlueBdg_B01ID',                # Does anyone in household have a blue badge
+              'CarPool_B01ID',                # Use of car from company car-pool
+              'ConcTravElig_B01ID',           # Concessionary Travel Survey - Eligibility for elderly person concessionary travel scheme
+              'ConcTravFare_B01ID',           # Concessionary Travel Survey - Type of bus fare concession
+              'HHoldAreaType1_B01ID',         # Household Area Type - Settlement size (urban/rural) excluding South Yorkshire in Metropolitan Areas - 15 categories
+              'HHoldAreaType2_B01ID',         # Household Area Type - Settlement size (urban/rural) including South Yorkshire in Metropolitan Areas - 16 categories
+              'HHoldAreaType2_B02ID',         # Household Area Type - Settlement size (urban/rural) including South Yorkshire in Metropolitan Areas - 7 categories
+              'HHoldCVAvail_B01ID',           # Car / light van (including landrover, jeep, minibus etc) availability in household   
+              'HHoldEmploy_B01ID',            # Number of employed in household - broken down by full and part time workers   
+              'HHoldFulltime',                # Number of full time workers in household
+              'HHIncome2002_B01ID',            # Household income 
+              'HHoldNumAdults',               # Number of adults in household - actual number 
+              'HHoldNumChildren',             # Number of children in household - actual number    
+              'HHoldNumPeople',               # Total number of people in household - actual number
+              'HHoldOAClass2011_B01ID',       # 2011 Census Output Area Classification - Subgroup - 76 bands
+              'HHoldOAClass2011_B02ID',       # 2011 Census Output Area Classification - Group - 26 bands
+              'HHoldOAClass2011_B03ID',       # 2011 Census Output Area Classification - SuperGroup - 8 bands
+              'HHoldOSWard_B01ID',            # ONS ward code
+              'HHoldPartTime',                # Number of part time workers in household
+              'HHoldStruct_B01ID',            # Household structure - 33 categories    
+              'HHoldStruct_B03ID',            # Household structure - 10 categories     
+              'HRPAgeSex_B01ID',              # Household Reference Person (HRP) - Age and Gender
+              'HRPEmpStat_B01ID',             # Household Reference Person (HRP) - employment status  
+              'HRPSEG_B01ID',                 # Household Reference Person (HRP) - Socio Economic Group (SEG)
+              'HRPSIC2007_B02ID',             # Household Reference Person (HRP) - Standard Industrial Classification (SIC) - 2007 bandings  - Summary - 21 categories
+              'HRPWorkStat_B01ID',            # Household Reference Person (HRP) - working status - 7 categories   
+              'IMD2010Rank_B01ID',            # Index of multiple deprivation - banded value - 2010 bandings - England only
+              'NumVehicles',                  # Number of household vehicles - actual number
+              'ONSACGrp_B01ID',               #  Household NS 2001 Area Classification of wards Group Level   
+              'ONSACSub_B01ID',               # Household NS 2001 Area Classification of wards Sub-Group Level
+              'ONSACSup_B01ID',               # Household NS 2001 Area Classification of wards Super Group Level 
+              'Settlement2011EW_B01ID',       # ONS Rural-Urban Classification of residence- 2011 Census - 18 categories
+              'Settlement2011EW_B02ID',       # ONS Rural-Urban Classification of residence- 2011 Census - 5 categories
+              'SettlementEW_B01ID',           # Household ONS/DEFRA urban and rural classification - England and Wales 
+              'Ten1_B01ID')                   # Type of tenancy - 6 categories 
+
+#provide imputation indicator
+data.reduced  <- hh %>% filter(HHIncOrig_B01ID!=4) %>% mutate(imputed=HHIncOrig_B01ID==3) %>% dplyr::select(imputed,PSUID,SurveyYear,features,UA=HHoldOSLAUA_B01ID,ward=HHoldOSWard_B01ID)
+
+#Add LA geography
+UA_geo <- st_read('../wardlookup/LA_geometry_2016/Local_Authority_Districts__December_2016__GB_BGC.shp') %>% st_transform(27700) %>% dplyr::select(LAD16CD,LAD16NM)
+coords <- UA_geo %>% st_centroid() %>% st_coordinates()
+UA_geo$coord.x <- coords[,'X'] 
+UA_geo$coord.y <- coords[,'Y'] 
+
+#LAD census codes have been recoded since the historic surveys and need updating to present current day
+missing_codes <- data.reduced[['UA']][!(data.reduced[['UA']] %in% UA_geo[['LAD16CD']])] %>% unique()
+
+
+website=("https://findthatpostcode.uk/areas/")
+replacement <- map_chr(missing_codes,
+                       ~GET(paste0(website,.x,".json")) 
+                       %>% content(as='text') 
+                       %>% fromJSON() 
+                       %>% {.$data$relationships$successor$data$id[1]}
+)
+names(replacement) <- missing_codes
+data.reduced[,'UA'] <- dplyr::recode(data.reduced[['UA']],!!!replacement)
+# data.reduced <- UA_geo %>% left_join(data,by=c('LAD16CD'='UA')) %>% rename(UA=LAD16CD)
+```
+
+<!-- A Heckman model will be used. This requires an outcome and selection model: -->
+<!-- \[ Y^*_{ij} \sim \mathcal{N}(\boldsymbol{\beta} \mathbf{x}_{ij},\mu_Y) \]  -->
+<!-- \[ R^*_{ij} \sim \mathcal{N}(\boldsymbol{\gamma}_0 \mathbf{x}_{ij} +\gamma_1 y^*_{ij},\mu_R) \] -->
+
+<!-- where $Y^*_{ij}$ is the outcome for individual $i$ in areal unit $j$ and $R^*_{ij}$ is the recording propensity for the individual. These are latent variables with the relationship to the observed variables $R_{ij}= 1 \text{ if } R^*_{ij}>0 \text{ and } 0 \text{ o'wise}$, and $Y_{ij}=Y^*_{ii} \times R_{ij}$. The $x_{ij}$ are other observed explanatory variables and associated regression coeffiecients. The important parameter to make it NMAR is $\gamma_1$ and we seek to replace the outcome model with  -->
+<!-- \[ y^*_{ij} \sim \mathcal{N}(\mathbf{\alpha_{j}},\mu_y) \]  -->
+<!-- where $\alpha_j$ is mean outcome for areal unit $j$ and combine the equations into  -->
+<!-- \[ R^*_{ij} \sim \mathcal{N}(\boldsymbol{\gamma}_0 \mathbf{x}_{ij} +\gamma_1\alpha_j,\mu_R + \gamma_1 \mu_y) \] -->
+<!-- which can be solved through straightforward OLS. -->
+
+The variable of missingness being investigated is whether or not a question on household income was answered by the Household Reference Person (the nominal head of household for the purposes of hte survey). This will be regressed across over household level survey data. The size of the dataset is `r format(dim(hh)[1],big.mark=",")` observations across `r dim(hh)[2]` variables. These variables include address type information, accessibility of public transport, access to amenities, household vehicle access, household composition and household socio-economic information.
+
+### Spatial structure
+The overall proportion of missing income data is `r format(mean(data.reduced$imputed)*100,digits=0)`%. To initially examine spatial structure, the proportions of missingness are aggregated at a Unitary Authority level, as plotted below. The first graph shows the observed proportions for each UA. The second shows the z-statistic for that observed proportion, assuming a null model for the logistic regression. i.e a binomial distribution for missingness, with the same probability of missingness for each participant (estimated as the overall proportion of missingness). The model obviously doesn't fit well - there are large residuals and patterns indicate underestimation in urban areas and over-estimation in rural areas.
+
+```{r missingness_LA,cache=TRUE,out.width = "100%"}
+#aggregate data at a UA level
+UA_df <-   data.reduced %>% group_by(UA) %>% summarise(missing=sum(imputed),
+                                                       count=n(),
+                                                       observed_p=missing/count,
+                                                       est_p=mean(data.reduced$imputed),
+            ) %>% 
+  rowwise() %>% mutate(p_value=binom.test(missing,count,est_p,"less") %>% {.$p.value},z=p_value%>% max(1e-16) %>% min(1-1e-16) %>% qnorm())
+
+UA_df <- UA_geo %>% inner_join(UA_df,by=c('LAD16CD'='UA')) %>% rename(UA=LAD16CD)
+ggplot(UA_df)+geom_sf(aes(fill=observed_p))+scale_fill_gradient2(midpoint = mean(data.reduced$imputed))+ theme(legend.position = "right")+guides(fill = "legend")+labs(title='Proportion missing income responses by Unitary Authority')
+ggplot(UA_df)+geom_sf(aes(fill=z))+scale_fill_gradient2()+ theme(legend.position = "right")+guides(fill = "legend")+labs(title='Z-statistic for observed missingness by Unitary Authority')
+
+```
+### Testing Missing At Randomness
+To test whether household income is Missing Not At Random, missingness must be regressed against income. Household income is available for all households in the survey: either directly if answered, otherwise it has been imputed as part of the survey data processing. The model specification for imputing income is not shared, but we presume it assumes a MAR distribution, which may be unreliable for parameter estimation if that assumption does not hold, which is our belief.
+
+In order to have an alternative unbiased approximation of household income, we make use of location by associating households with areal mean income estimates. We use the [Office of National Statistics small area income estimates](https://www.ons.gov.uk/employmentandlabourmarket/peopleinwork/earningsandworkinghours/datasets/smallareaincomeestimatesformiddlelayersuperoutputareasenglandandwales). This provides mean income estimates at a middle layer super output area (MSOA) level. The estimates have been produced primarily through using the Family Resources Survey and performing a hierarchical regression with areal-level attributes generating an areal mean income estimate followed by an individual level regression performed using the areal mean. Further details are located in the  [technical report](https://www.ons.gov.uk/file?uri=/peoplepopulationandcommunity/personalandhouseholdfinances/incomeandwealth/methodologies/smallareamodelbasedincomeestimatesenglandandwalesfinancialyearending2016technicalreport/technicalreport201516.pdf). It should be noted that the majority of the variance is at the individual level, and that the regression is undertake against Log(income) to deal with the skewed distribution of income. 
+
+There is a loose correlation between survey household income and areal level income. Note that Household income provided in the survey is banded, and the midpoints of the band ranges have been used.
+
+```{r add_survey_year, include=FALSE}
+psu= read_tsv(paste('../UKDA-7553-tab/tab/','psu_special_2002-2019_protect.tab',sep='/'))
+data.reduced <-  data.reduced%>% left_join(psu %>% dplyr::select(PSUID,SurveyYear)) %>% dplyr::select(!PSUID)
+```
+```{r factor_dictionary, include=FALSE}
+data.recoded <- data.reduced%>% 
+  mutate(
+    gender=case_when(HRPAgeSex_B01ID==-8 ~ NA_character_,
+                     HRPAgeSex_B01ID<10  ~ "M",
+                     TRUE ~ "F"),
+    age_band= case_when(HRPAgeSex_B01ID==-8 ~ NA_real_,
+                        gender=="M"  ~ HRPAgeSex_B01ID,
+                        TRUE ~ HRPAgeSex_B01ID-9),
+    IMD2010=IMD2010Rank_B01ID %>% na_if(-8) %>% na_if(-9)
+  ) %>% 
+  dplyr::select(!c(HRPAgeSex_B01ID,IMD2010Rank_B01ID)) %>%
+  mutate(across(matches("B0[1-3]ID$"),factor))
+
+
+#read in our dictionary of banded variables
+
+factor_dic <- readxl::read_excel('../UKDA-7553-tab/mrdoc/excel/7553_nts_lookup_table_banded_variables_2018.xlsx',sheet = 'Household LUT',col_types = 'text') %>%
+  dplyr::select(var=`SQL variable name`,factor_=`New Value`,level_=`Values Description`)
+factor_dic <- fill(factor_dic,var)
+factor_list <- factor_dic %>% nest_by(var) %>% ungroup()
+factor_list$coding=factor_list$data %>% map(~set_names(.x$factor_,.x$level_))
+
+data.reduced %>% dplyr::select(where(is.factor)) %>% colnames() %>%
+  map_lgl(~any(grepl(.x,factor_list$var,ignore.case=TRUE))) %>%  all() %>% 
+  print() # case-insensitive search
+
+recode <- function(data,id){
+  names <-  factor_list[grepl(id,factor_list$var,ignore.case=TRUE),] %>%{.$coding[[1]]}
+  return(fct_recode(data,!!!names))
+}
+
+data.recoded <- data.recoded %>% mutate(across(where(is.factor),~recode(.x,cur_column())))
+data.recoded <- data.recoded %>% mutate(across(where(is.factor),~factor(replace(.x, .x == "NA", NA))))
+data.recoded$gender <- factor(data.recoded$gender)
+data.recoded$HHincome <- data.recoded$HHIncome2002_B01ID %>% gsub(",","",.) %>% regmatches(.,gregexpr('\\d*,?\\d+',.)) %>% map_dbl(~mean(as.numeric(.x)))/1000
+data.recoded <- data.recoded %>% dplyr::select(-HHIncome2002_B01ID)
+```
+```{r areal_income,echo=FALSE,results=FALSE, warning=FALSE,message=FALSE,cache=TRUE}
+# create a lookup table from historic ward (inNTS survey) to 2016 ward and MSOA
+ward2016 <- st_read('../wardlookup/geometry_2016/Wards__December_2016__Boundaries_UK_BGC.shp') %>% st_transform(27700) %>% st_centroid() %>% dplyr::select(code="WD16CD") 
+ward2015 <- st_read('../wardlookup/geometry_2015/Wards_(December_2015)_Boundaries.shp')  %>% st_transform(27700) %>% st_centroid() %>% dplyr::select(code="wd15cd") 
+ward2011 <- st_read('../wardlookup/geometry_2011/Wards_(December_2011)_Boundaries_EW_BGC.shp') %>% st_transform(27700) %>% st_centroid() %>% dplyr::select(code="wd11cd")
+
+lookup <- bind_rows(ward2016,ward2015,ward2011) %>% 
+  {.[!duplicated(.$code),]} %>% 
+  st_join(ward2016,st_nearest_feature) %>%
+  dplyr::select(code=code.x,code2016=code.y)
+
+msoa2011 <- st_read('../wardlookup/msoa_geometry_2011/Middle_Layer_Super_Output_Areas_(December_2011)_Boundaries_Generalised_Clipped_(BGC)_EW_V3.shp')%>% st_transform(27700) %>% st_centroid() %>% dplyr::select(msoa="MSOA11CD") 
+
+lookup <- lookup %>% st_join(msoa2011,st_nearest_feature)
+
+# Income estimate by ward
+filepath = '../ons_est_income/'
+filename='total.csv'
+colnames = read_lines(paste(filepath,filename,sep='/'),skip=4,n_max=1) %>% str_split(',') %>% .[[1]]
+colnames2 = map_chr(colnames,~strsplit(.x,' \\(') %>% {.[[1]][[1]]})
+lookup <- left_join(lookup,read_csv(paste(filepath,filename,sep='/'),skip=5,col_names=colnames2) %>%
+  dplyr::select(msoa=`MSOA code`,income=`Total annual income`))
+data.recoded <-  lookup %>% dplyr::select(income,code2016) %>% inner_join(data.recoded,by=c('code2016'='ward')) %>%  mutate(income=income/1000)
+
+ggplot(data.recoded)+geom_point(aes(x=income,y=HHincome),alpha=0.2,size=1)+geom_smooth(aes(x=income,y=HHincome))+scale_x_log10()+scale_y_log10()+labs(title='Survey household income against areal estimates',x='Areal Income',y='Household Income')
+
+```
+```{r income_regression}
+lm(HHincome~income,data=data.recoded) %>% summary()
+```
+```{r load_objects,include=FALSE}
+uni.model <- readRDS('uni.model.rds')
+reduced.model <- readRDS('reduced.model.rds')
+main.model <- readRDS('main.model.rds')
+full.model <- readRDS('full.model.rds')
+uni.model.hh <- readRDS('uni.model.hh.rds')
+reduced.model.hh <- readRDS('reduced.model.hh.rds')
+main.model.hh <- readRDS('main.model.hh.rds')
+full.model.hh <- readRDS('full.model.hh.rds')
+data <- readRDS('data.rds')
+```
+
+A model building process generates a plausible logistic model (the main effects model) for the imputation process. Full details of the process are included in Appendix 1. 
+The main purpose of the model is to determine confounding factors for a regression of income against missingness. The fitted coefficients for income are compared for four possible models: a full model, which includes c.40 variables shortlisted for inclusion, a main model as mentioned above, a reduced model which varies the main model by excluding  a classifier for region, and a univariate model based solely on income.
+
+The formula for the main model is as follows: `r print(main.model$formula)`.
+The comparison of model shows the following:
+
+* Areal income is a statistically significant predictor of missingness in an univariate model, however the effect is primarily due to confounding with a regional effect on missingness (see the difference between the reduced model which has similar coefficients for income, and the main model. The only difference between the two models is a high level area type indicator, with the majority of effect beign a London/non-London divsion. This is due to London wards having markedly higher levels of missingness, as well as a high average income. 
+* Once this is accounted for, income has only a minor effect, which is not statistically significant within the c.100,000 observations used. The coefficient for income was stable when trimming the model from the full model (40 features) to the reduced model (5 features)
+* It may well be that the weakness of income as a predictor is simply due to MSOA-level incomes having little predictive power for individual level income (the variance in the model levels for the MSOA income estimates can be found in more detail in the technical notes for the income data set).  Hence we repeat the exercise using the HHincome estimates provided for the dataset. 
+* Using Household income, the relationship between income and missingness is now more statistically significant and the coefficient is fairly stable across all models. 
+* However the effect remains small. This is unsurprising, as that the income estimation model presumably assumes missingness at random, and hence a statistically significant relationship must be due to the residual effect of further variables used in the income model.
+* The size of the effect is similar in the main model for both soruces of income estimation. The Areal income is around twice the effect size of the household income, but this seems reasonalbe parity given the underlying reversion to mean which occurs from using the areal data. 
+* Speculatively, the similar effect size between the different sources of income estimation perhaps indicates that MAR is a reasonable modelling assumption.
+
+
+```{r model_comparison,error=TRUE}
+models <- list(uni.model=uni.model,reduced.model=reduced.model,main.model=main.model,full.model=full.model,uni.model.hh=uni.model.hh,reduced.model.hh=reduced.model.hh,main.model.hh=main.model.hh,full.model.hh=full.model.hh)
+model_comparison <- models %>% map_dfr(~broom::tidy(.x) %>% filter(term=='log(income)' |term=='log(HHincome)' )) %>% mutate(name=names(models)) %>% dplyr::select(name,!term)
+model_comparison 
+```
+
+### Examining the regression model for spatial correlation.
+Having generated an aspatial logistic model it is examined for any spatial dependency in the outcomes. Similar to the initial anlysis of spatial structure, the observations are grouped by unitary authority (UA) and observed missingness compared to model predictions, generating residuals as p-values to a binomial test, and corresponding z-values. The UA-level observations are then tested for global spatial correlation.
+
+```{r geo_data,error=TRUE}
+#Aggregate to a UA level
+UA_df <-   main.model %>% predict(type='response') %>% {bind_cols(est_p=.,data %>% dplyr::select(code2016,UA,imputed))} %>% 
+  group_by(UA) %>% 
+  summarise(missing=sum(imputed),
+            count=n(),
+            expected_missing=sum(est_p),
+            observed=count-missing,
+            est_p=expected_missing/count,
+            observed_p=missing/count) %>% 
+  rowwise() %>% mutate(p_value=binom.test(missing,count,est_p,"less") %>% {.$p.value},z=p_value%>% max(1e-16) %>% min(1-1e-16) %>% qnorm())
+
+UA_df <- UA_geo %>% left_join(UA_df,by=c('LAD16CD'='UA'))
+UA_df[is.na(UA_df$z),'z']=0
+nb <- poly2nb(UA_df)
+lw <- spdep::nb2listw(nb,style="C",zero.policy = TRUE)
+```
+
+A Moran plot and Moran's I test strongly indicate spatial autocorrelation is present.
+```{r autocorrelation_test,error=TRUE,message=FALSE,warning=FALSE}
+moran.plot(UA_df$z,lw,zero.policy = TRUE)
+moran.test(UA_df$z,lw,zero.policy = TRUE)
+```
+
+A SAR model is fit to the data, with the effect of lowering the estimated income coefficient further towards zero. All coefficients are relatively stable to the introduction of the saptial term.
+```{r sar_model,error=TRUE,cache=TRUE}
+data_geo <- UA_geo %>% left_join(data %>% st_drop_geometry(),by=c('LAD16CD'='UA')) %>% rename(UA=LAD16CD)
+main.model.sar <- fitme(imputed ~ sqrt(HHoldNumAdults) + age_band + HRPEmpStat_B01ID + 
+    HRPWorkStat_B01ID + HHoldAreaType2_B02ID + gender + log(income)+Matern(1|coord.x+coord.y),data=data_geo,family=binomial)
+summary(main.model.sar)
+```
+
+Finally, local Moran's I tests are undertaken to examine local areas of high autocorrelation. There are a number of interesting areas in Scotland and elsewhere, which have higher levels of missingness than expected.
+
+
+```{r LISA,error=TRUE,cache=TRUE}
+local <- localmoran(UA_df$z,lw,zero.policy = TRUE) %>% as.data.frame()
+UA_df <- bind_cols(UA_df,local)
+breaks<-c(-1000,-2.58,-1.96,1.96,2.58,1000)
+UA_df$Iz_cut <- cut(UA_df$Z.Ii,breaks)
+ggplot(UA_df)+geom_sf(aes(fill=Iz_cut))+scale_fill_brewer(palette = "PRGn",drop=FALSE)+ theme(legend.position = "right")+guides(fill = "legend")
+```
+
+
+
+
+# Appendix: Model building process
+
+## Preprocessing
+The first step in the process is to reduce the independent variables from `r dim(hh)[2]` to `r dim(data.reduced)[2]` which may potentially be relevant.
+```{r ref.label=c('libraries','import-data'), echo=TRUE, eval=FALSE}
+```
+
+The data is then preprocessed to:
+
+* include observation survey year, in case of varying missingness over time. This is obtained by joining the Household data to Primary Sample Unit data in the NTS dataset via a sampling unit ID. 
+* recode the factors to a meaningful text value using a NTS data dictionary. Age and gender are subsequently deduced from coding, and age and gender and income converted to ordinal data from their banded values.
+```{r ref.label=c('add_survey_year','factor_dictionary'), echo=TRUE, eval=FALSE}
+```
+
+Areal level income estimates are included using the following approach. In order to associate household location from the survey, which is available at a ward level, with income estimates, generated at an MSOA level,a lookup table of income is created for each ward. The geometries for the wards and the MSOA are loaded and a spatial join performed based on nearest matching feature using the polygon centroids. As part of this, historic ward information is matched to current day wards. 
+
+c.50,000 observations are lost during the the matching process, because disclosure of ward information stopped in 2016 with only UA location given thereafter. Ward location is preferred to give closer matching to the MSOA-income. 
+
+```{r ref.label=c('areal_income'), echo=TRUE, eval=FALSE}
+```
+
+## Univariate analysis
+Having preprocessed the data, variable selection proceeds by undertaking univariate analysis by contingency table chi-square testing on factors. We subset the data to 5,000 observations to reduce the sensitivity to small effects.  
+
+```{r contingency_tables, warning=FALSE, echo=TRUE}
+factors <- data.recoded %>% st_drop_geometry() %>% dplyr::select(where(is.factor))  %>% colnames() 
+data.sample <- data.recoded %>% slice_sample(n=5000)
+tables=factors %>% map(~table(data.sample$imputed,data.sample[[.x]],
+                    exclude=c('-10',NA,'DNA')) %>% {.[,marginSums(.,2)>0]})
+
+p.value <- tables %>%  map_dbl(~ chisq.test(.x) %>% {.$p.value})
+odds.ratio <- tables %>% map_dbl(~prop.table(.x,2) %>% {.[1,]/.[2,]} %>% {(max(.,na.rm=TRUE)/min(.,na.rm=TRUE))})
+univariate.factors <- tibble(factors,p.value,odds.ratio) %>% {.[order(p.value>0.05,-odds.ratio),]}
+univariate.factors
+```
+
+Investigating key factors further, it appears household structure as a combination of age and number of adults has a sizable effect. Otherwise there are a employment related indicators that have an effect, as does geography in a number of different areal classifications: London has a very significant geographic effect. 
+```{r investigate_factors, echo=TRUE}
+data.recoded %>% st_drop_geometry() %>% dplyr::select(imputed,HHoldStruct_B03ID) %>% table(exclude=c('-10',NA)) %>% prop.table(margin=2) 
+data.recoded  %>% st_drop_geometry() %>% dplyr::select(imputed,HHoldAreaType2_B02ID) %>% table(exclude=c('-10',NA)) %>% prop.table(margin=2) 
+data.recoded  %>% st_drop_geometry() %>% dplyr::select(imputed,HRPEmpStat_B01ID) %>% table(exclude=c('-10',NA)) %>% prop.table(margin=2)
+
+```
+
+Next univariate regression is applied to ordinal data. Age and number of people are significant with a large effect. Survey year is also significant with a small effect, as is income and household income also with a small effect. IMD rank is not a good predictor, somewhat surprisingly, despite the links to employment status. 
+```{r univariate_regression,  echo=TRUE}
+nonfactors <- data.recoded %>% st_drop_geometry() %>% dplyr::select(!where(is.factor)) %>% dplyr::select(-c(imputed,code2016))%>% colnames()
+univariate.regression <-  nonfactors  %>% map(~paste0('imputed~',.x) %>% as.formula())  %>% map_dfr(~glm(.x,data=data.sample,family='binomial') %>% broom::tidy() %>% {.[2,c('term','estimate','statistic')]})
+univariate.regression[order(abs(univariate.regression$statistic),decreasing = TRUE),]
+```
+
+## Reducing the model
+```{r remove_NA,  echo=TRUE}
+
+data <- data.recoded %>% dplyr::select(!starts_with('ONSAC')) %>% dplyr::select(-c(BlueBdg_B01ID,ConcTravFare_B01ID,IMD2010,SettlementEW_B01ID,HRPSIC2007_B02ID)) %>% mutate(across(where(is.factor),~factor(replace(.x, .x == "-10", NA)))) %>% na.omit()
+
+```
+To undertake a multivariate analysis it is firstly necessary to clean the data set to remove partial cases - these typically relate to the change over time of recorded information (coded as -10 in the data when a question was not asked). As part of this we remove insignificant features with a high number of missing results. NB: ONSAC.... groupings are a geodemographic variable superceded by HHoldOAClass2011... since 2014. We use the latter only. This reduces the data set size to `r dim(data)[1]` observations.
+
+An initial model is produced using all significant factors identified in the univariate analysis above, (plus gender even though it was not a significant univariate), using the coarsest possible bandings where there is a choice of granularity. 15 factors in total. A number of variables were removed on the basis that they heavily overlap with other variables, picking the coarsest possible grouping available. For example, household income was excluded to prefer UA income, and factors relating to household structure were excluded in preference to age, number of adults and number of children.
+
+```{r full.model, echo=TRUE}
+
+initial.factors <- c(c('HHoldNumAdults','age_band','HHoldNumChildren','income','SurveyYear'),
+                    c("HRPSEG_B01ID","HRPEmpStat_B01ID","Ten1_B01ID","HHoldOAClass2011_B03ID","HRPWorkStat_B01ID","Settlement2011EW_B01ID","CarPool_B01ID","HHoldAreaType2_B02ID","AddressType_B01ID","gender"))      
+f <- as.formula(paste0('imputed ~',paste(initial.factors,collapse= " + ")))
+full.model <- glm(f, data = data, family = binomial)
+print(broom::tidy(full.model))
+```
+
+We subject this initial model to variable removal and likelihood ratio testing to identify non-significant variables. Income appears insignificant but kept in. HRPSEG_B01ID was removed despite being significant as there is a large overlap with HRPEmpStat_B01ID as a coarser feature. CarPool was removed as the significance arose from the number of "DNA" answers which is a poor causal factor for income imputation, as opposed to an overlapping outcome.
+```{r main.model, echo=TRUE}
+drop1(full.model,test="LRT")
+main.model <- update(full.model,. ~. - CarPool_B01ID - Settlement2011EW_B01ID - HRPSEG_B01ID -HHoldOAClass2011_B03ID - SurveyYear)
+drop1(full.model,test="LRT")
+print(broom::tidy(main.model))
+```
+
+While the remaining factor variables in the model are significant, many of the factor levels have similar effects and hence factors are recoded to merge similar effects. Number of children is split into an indicator for having children and a separate variable for the number of children. Upon refitting the model, children is no longer a significant indicator, and Tenancy type and Address Type are removed because of their unclear causal links with response and the potential for interactions with other features.A log transform is taken for income given typical income distribution skew.
+A reduced model is considered which removes HHoldAreaType2_B02ID as geographic indicator, to compare the effect on the income coefficient.
+
+```{r factor_simplification, echo=TRUE}
+data.recoded2 <- data.recoded
+data.recoded2$children <- (data.recoded2$HHoldNumChildren>0)
+levels(data.recoded2$HRPWorkStat_B01ID) <- c("Working","Working","Other non-working","Retired/Permanently Sick","Other non-working","Other non-working","Other non-working")
+levels(data.recoded2$AddressType_B01ID) <- c("House / bungalow (detached)","House / bungalow (semi-detached)","House / bungalow (terrace / end terrace)", "Other",
+                                            "Flat","Flat","Flat","Other")
+data <- data.recoded2 %>% st_drop_geometry() %>% dplyr::select(!starts_with('ONSAC')) %>% dplyr::select(-c(BlueBdg_B01ID,ConcTravFare_B01ID,IMD2010,SettlementEW_B01ID,HRPSIC2007_B02ID)) %>% mutate(across(where(is.factor),~factor(replace(.x, .x == "-10", NA)))) %>% na.omit()
+main.model <- glm(main.model$formula,data=data,family=binomial)
+main.model <- update(main.model,.~. + children)
+print(broom::tidy(full.model))
+drop1(main.model,test="LRT")
+full.model <- update(full.model,.~. - income + log(income) - children -HHoldNumChildren - Ten1_B01ID - AddressType_B01ID)
+print(broom::tidy(full.model))
+reduced.model <- update(full.model,.~ .-HHoldAreaType2_B02ID)
+print(broom::tidy(reduced.model))
+```
+
+It is clear that London boroughs (and other urban areas to a lesser extent) have markedly higher levels of missing income responses, that affect any regression of income using ward level aggregates. The income coefficient for the model including HHoldAreaType2_B02ID is `r coef(full.model)['log(income)']` and excluding it is `r coef(reduced.model)['log(income)']`
+
+Having selected the features to include, the continuous features are checked for linearity by plotting them in bands. All show non-linearity, hence fractional polynomials are used to check various non-linear fits. A square-root transform for age_band is suggested. A rather complex transform for log(income) is also suggested but the original is kept for easier interpreability.
+```{r variable transforms,message=FALSE,echo=TRUE,cache=TRUE}
+age.model <- update(full.model,.~ . - age_band+factor(age_band))
+age <- coef(age.model) %>% {.[grepl("^factor", names(.))]} 
+plot(age)
+
+adult.model <- update(full.model,.~ . -HHoldNumAdults +factor(HHoldNumAdults))
+adult <- coef(adult.model) %>% {.[grepl("^factor", names(.))]} 
+plot(adult)
+
+income.model <- update(full.model,.~ . -income +cut(income,include.lowest=T,breaks=(quantile(income,probs = seq(0, 1, by = 0.20)))))
+income <- coef(income.model) %>% {.[grepl("^cut", names(.))]} 
+plot(income)
+
+
+
+f <- mfp(imputed ~  fp(HHoldNumAdults) + fp( age_band ) + fp(log(income)) + HRPEmpStat_B01ID + 
+    HRPWorkStat_B01ID  + HHoldAreaType2_B02ID +
+    gender, data = data, family = binomial)
+
+summary(f)       
+```
+
+
+Having reduced the variables down to a main effects model, the process is not continued to test excluded variables for remaining significance or consider interactions. The purpose of the model is to distinguish confounding factors for an income regression, and by comparing the coefficients for the main effects model to a univariate and 'full' model (one with all the initially considered variables)  it can be seen that the main model and full model have similar effects.
+
+The models are  refit on the full data set. The coefficients show that the largest effects are due to the number of adults in the household (understandable as it is an estimate of combined household income) and age. The employment status and type of employment of the household reference person also has an effect, with large positive effects if the HRP is self-employed or has never worked. Gender has a minor effect. Income also has a minor effect, and it is not-statistically significant, which must be considered in the context of the c.100,000 observations being used. HHIncome as an alternaitve income estiamte is statistically significant and reveals a similar effect size.
+
+```{r model_refitting, echo=TRUE,cache=TRUE}
+data <- data.recoded2 %>% filter(!is.na(HHoldNumAdults),!is.na(age_band),!is.na(HRPEmpStat_B01ID),!is.na(HRPWorkStat_B01ID),!is.na(HHoldAreaType2_B02ID),!is.na(gender),!is.na(income))
+main.model <- glm(formula = imputed ~ sqrt(HHoldNumAdults) + age_band + HRPEmpStat_B01ID + 
+    HRPWorkStat_B01ID + HHoldAreaType2_B02ID + gender + log(income), 
+    family = binomial, data = data)
+print(broom::tidy(main.model))
+drop1(main.model,test="LRT")
+reduced.model <- update(main.model,.~.-HHoldAreaType2_B02ID)
+full.model <- update(full.model,.~.-income+log(income))
+uni.model <- glm(imputed~log(income),family=binomial,data=data)
+
+full.model.hh <- update(full.model,.~.-log(income)+log(HHincome))
+main.model.hh <- update(main.model,.~.-log(income)+log(HHincome))
+reduced.model.hh <- update(reduced.model,.~.-log(income)+log(HHincome))
+uni.model.hh <- glm(imputed~log(HHincome),family=binomial,data=data)
+```
+
+
+```{r save_objects,include=FALSE}
+saveRDS(uni.model,'uni.model.rds')
+saveRDS(reduced.model,'reduced.model.rds')
+saveRDS(main.model,'main.model.rds')
+saveRDS(full.model,'full.model.rds')
+saveRDS(uni.model.hh,'uni.model.hh.rds')
+saveRDS(reduced.model.hh,'reduced.model.hh.rds')
+saveRDS(main.model.hh,'main.model.hh.rds')
+saveRDS(full.model.hh,'full.model.hh.rds')
+saveRDS(data,'data.rds')
+```
+
+
+
+We undertake a chi-sq goodness-of-fit test, using a sampled data set to obtain a reasonable test power. With a sample size of 20,000, the model retains a significant effect for all its variables and passes a goodness-of-fit test.
+```{r goodness-of-fit,echo=TRUE,}
+
+main.model.reduced.data <- glm(main.model$formula, data = data %>% slice_sample(n=20000), family = binomial)
+summary(main.model.reduced.data)
+hoslem.test(main.model.reduced.data$y, main.model.reduced.data$fitted.values)
+```
+
+
+# References
